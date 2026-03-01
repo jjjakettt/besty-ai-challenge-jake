@@ -1,0 +1,333 @@
+Technical Design Document
+
+Project: Reservation Webhook Dashboard
+Language: TypeScript (Node.js)
+Database: PostgreSQL
+Time Constraint: 3 hours
+
+⸻
+
+1. Objective
+
+Build a system that:
+	1.	Receives reservation webhook events.
+	2.	Validates webhook authenticity.
+	3.	Hydrates guest data via Guest API.
+	4.	Stores reservations in Postgres.
+	5.	Displays reservations in a real-time updating frontend.
+	6.	Supports sorting, filtering, and broadcast messaging.
+	7.	Handles out-of-order events and strict rate limiting.
+
+System must be resilient, idempotent, and explainable.
+
+⸻
+
+2. System Architecture
+
+Components
+	1.	Backend (Node + Express)
+	•	Webhook ingestion
+	•	Hydration worker
+	•	Broadcast worker
+	•	SSE real-time stream
+	•	Postgres integration
+	2.	Postgres
+	•	reservations table (pre-existing, do not modify schema)
+	•	broadcast_jobs table (new)
+	3.	External Services
+	•	Guest API (http://localhost:3001)
+	•	Webhook Sender (Docker)
+	4.	Frontend
+	•	Reservation list UI
+	•	Real-time updates
+	•	Filtering and sorting
+	•	Broadcast UI
+
+⸻
+
+3. Core Design Decisions
+
+3.1 Idempotency Strategy
+
+Webhooks:
+	•	May arrive out of order.
+	•	May be duplicated.
+	•	Include created, updated, cancelled events.
+
+Rules:
+	•	Use reservation_id as primary key.
+	•	Always upsert.
+	•	Deduplicate by webhook_id — skip processing if already seen.
+	•	Treat cancelled as terminal state.
+	•	Never revert a cancelled reservation.
+	•	If cancel arrives before create, create cancelled record.
+	•	Skip update if incoming event_timestamp is older than stored event_timestamp.
+
+⸻
+
+3.2 Webhook Flow
+
+Endpoint:
+POST /webhooks
+
+Flow:
+	1.	Validate header X-Webhook-Secret.
+	2.	Parse payload.
+	3.	Check webhook_id — skip if already processed.
+	4.	Upsert reservation row with timestamp guard.
+	5.	Enqueue hydration job.
+	6.	Emit real-time update.
+	7.	Return 200 immediately.
+
+Important:
+Webhook handler must never block on API calls.
+
+⸻
+
+3.3 Database Strategy
+
+Use provided reservations table. Do not modify schema.
+
+Upsert pattern:
+	•	Insert if not exists.
+	•	On conflict (reservation_id):
+	•	Update fields only if incoming event_timestamp >= stored event_timestamp.
+	•	Never update status if current status is cancelled.
+
+All writes must be safe for duplicate events.
+
+broadcast_jobs table (new):
+
+CREATE TABLE broadcast_jobs (
+  id SERIAL PRIMARY KEY,
+  guest_id VARCHAR(50) NOT NULL,
+  message TEXT NOT NULL,
+  status VARCHAR(20) DEFAULT 'pending',
+  attempts INTEGER DEFAULT 0,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+This persists broadcast jobs across server restarts. Worker reads from DB, not memory.
+
+⸻
+
+4. Hydration System
+
+4.1 Problem
+
+Guest API is rate limited.
+Must respect 429 responses with Retry-After header.
+
+4.2 Solution
+
+Use in-memory queue with worker loop.
+
+HydrationJob:
+	•	reservationId
+	•	guestId
+	•	attempts
+
+Worker rules:
+	•	Limited concurrency (2–3 max).
+	•	On 429:
+	•	Read Retry-After.
+	•	Sleep.
+	•	Retry job.
+	•	On 404:
+	•	Stop retrying.
+	•	On success:
+	•	Update reservation with guest data.
+	•	Emit real-time update.
+
+Recovery on startup:
+	•	Query reservations where guest_first_name IS NULL.
+	•	Re-enqueue hydration jobs for all incomplete records.
+	•	No extra table needed.
+
+Optional:
+Add short-lived in-memory guest cache (Map<guestId, guestData>) to reduce duplicate API calls.
+
+⸻
+
+5. Real-Time Updates
+
+Chosen Approach: Server-Sent Events (SSE)
+
+Reason:
+	•	One-directional streaming is sufficient.
+	•	Simpler than WebSockets.
+	•	Minimal implementation complexity.
+
+Backend:
+GET /events
+	•	Keep connection open.
+	•	Emit reservation updates as JSON events.
+	•	Clean up listener on client disconnect.
+
+GET /reservations
+	•	Return full current reservation list.
+	•	Used for initial load and SSE reconnect.
+
+Frontend:
+	•	Use EventSource.
+	•	On connect, fetch full reservation list from GET /reservations.
+	•	Apply live SSE events on top.
+
+⸻
+
+6. Broadcast System
+
+6.1 Requirements
+	•	Send message to all guests in filtered list.
+	•	Must eventually deliver all messages.
+	•	Must handle rate limiting.
+	•	Must retry transient failures.
+	•	Jobs must persist across server restarts.
+
+6.2 Backend Flow
+
+Endpoint:
+POST /broadcast
+
+Input:
+	•	message
+	•	list of guestIds or reservationIds
+
+Steps:
+	1.	Validate message.
+	2.	Insert broadcast jobs into broadcast_jobs table with status pending.
+	3.	Return immediately.
+
+6.3 Broadcast Worker
+
+Worker reads pending jobs from broadcast_jobs table.
+
+Worker behavior:
+	•	Process jobs at low concurrency.
+	•	On 200:
+	•	Update status to sent.
+	•	On 429:
+	•	Respect Retry-After.
+	•	Increment attempts, retry.
+	•	On 400/404:
+	•	Update status to failed (permanent).
+	•	On 500:
+	•	Retry with exponential backoff up to max attempts.
+
+Recovery on startup:
+	•	Query broadcast_jobs WHERE status = 'pending'.
+	•	Resume processing all pending jobs.
+
+Goal:
+Eventual delivery of all valid messages with no duplicates.
+
+⸻
+
+7. Rate Limiting Strategy
+
+All Guest API calls must go through a centralized wrapper.
+
+Wrapper handles:
+	•	Retry-After header
+	•	Backoff logic
+	•	Concurrency control
+
+Never fire uncontrolled parallel requests.
+
+⸻
+
+8. Frontend Design
+
+State
+	•	reservations: Reservation[]
+	•	filters
+	•	sort state
+
+Features
+	•	Real-time updating list.
+	•	Client-side filtering.
+	•	Client-side sorting.
+	•	Broadcast button appears only when filtered subset exists.
+	•	Modal or prompt for broadcast message.
+
+Filtering and sorting must be pure functions.
+
+⸻
+
+9. Error Handling
+
+Webhook:
+	•	Invalid secret → 401
+	•	Bad payload → 400
+	•	Unexpected error → 500
+	•	Always respond quickly
+
+Hydration:
+	•	Retry 429 with Retry-After
+	•	Stop on 404
+	•	Retry 5xx up to 3 times with backoff
+	•	Log failures
+
+Broadcast:
+	•	Retry transient errors (429, 500)
+	•	Stop on permanent errors (400, 404)
+	•	Track attempts in DB
+
+SSE:
+	•	Clean up listeners on disconnect
+	•	Allow reconnect and resync via GET /reservations
+
+⸻
+
+10. Startup Flow
+
+On server start:
+	1.	Connect to Postgres.
+	2.	Create broadcast_jobs table if not exists.
+	3.	Register webhook via POST /webhooks/register. Retry with delay if it fails.
+	4.	Query reservations where guest_first_name IS NULL and re-enqueue hydration jobs.
+	5.	Query broadcast_jobs WHERE status = 'pending' and resume broadcast worker.
+	6.	Start hydration worker.
+	7.	Start broadcast worker.
+	8.	Start HTTP server.
+
+Webhook re-registration:
+	•	If health monitoring drops the webhook URL, re-register on next startup or via a periodic check.
+
+⸻
+
+11. Implementation Order
+	1.	Boot docker services.
+	2.	Build Express server with Postgres connection.
+	3.	Create broadcast_jobs table on startup.
+	4.	Implement webhook endpoint with secret validation, deduplication, upsert, and timestamp guard.
+	5.	Implement hydration queue and worker with rate limit handling.
+	6.	Implement SSE endpoint and GET /reservations.
+	7.	Build frontend list view with real-time updates.
+	8.	Add filtering and sorting.
+	9.	Implement broadcast endpoint and worker with DB persistence.
+	10.	Add rate limit handling polish and recovery logic.
+
+⸻
+
+12. Scalability Considerations (Explainable)
+
+Future improvements:
+	•	Replace in-memory hydration queue with Redis/BullMQ.
+	•	Separate ingestion and processing into different services.
+	•	Use distributed rate limit coordination.
+	•	Add horizontal scaling with stateless API nodes.
+	•	Promote broadcast_jobs to a full job queue service.
+
+⸻
+
+13. Key Design Guarantees
+	•	Idempotent webhook handling via reservation_id upsert and webhook_id deduplication.
+	•	Safe out-of-order event processing via event_timestamp guard.
+	•	Cancelled is terminal — never reverted.
+	•	Asynchronous processing to avoid webhook health failure.
+	•	Rate-limit aware hydration and broadcast.
+	•	Broadcast jobs and hydration state persist across restarts.
+	•	Clean separation of ingestion, processing, and presentation.
+	•	Real-time user experience via SSE.
