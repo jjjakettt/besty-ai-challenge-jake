@@ -27,26 +27,29 @@ export function createWebhookRouter(
     }
 
     const body = req.body;
+    const d = body.data ?? body;  // support both nested and flat payloads
+
+    const reservation: ReservationRow = {
+      reservation_id:  d.reservationId  ?? d.reservation_id,
+      property_id:     d.propertyId     ?? d.property_id,
+      guest_id:        d.guestId        ?? d.guest_id,
+      status:          d.status,
+      check_in:        d.checkIn        ?? d.check_in,
+      check_out:       d.checkOut       ?? d.check_out,
+      num_guests:      d.numGuests      ?? d.num_guests,
+      total_amount:    String(d.totalAmount ?? d.total_amount),
+      currency:        d.currency,
+      webhook_id:      body.webhookId   ?? body.webhook_id   ?? d.webhookId ?? d.webhook_id,
+      event_timestamp: body.timestamp   ?? body.event_timestamp ?? d.event_timestamp,
+    };
+
     for (const field of REQUIRED_FIELDS) {
-      if (body[field] == null || body[field] === '') {
+      if (reservation[field as keyof ReservationRow] == null ||
+          reservation[field as keyof ReservationRow] === '') {
         res.status(400).json({ error: `Missing field: ${field}` });
         return;
       }
     }
-
-    const reservation: ReservationRow = {
-      reservation_id:  body.reservation_id,
-      property_id:     body.property_id,
-      guest_id:        body.guest_id,
-      status:          body.status,
-      check_in:        body.check_in,
-      check_out:       body.check_out,
-      num_guests:      body.num_guests,
-      total_amount:    body.total_amount,
-      currency:        body.currency,
-      webhook_id:      body.webhook_id,
-      event_timestamp: body.event_timestamp,
-    };
 
     if (seenWebhookIds.has(reservation.webhook_id)) {
       res.status(200).json({ ok: true });
