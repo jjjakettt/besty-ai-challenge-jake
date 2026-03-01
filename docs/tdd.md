@@ -72,7 +72,7 @@ POST /webhooks
 
 Flow:
 	1.	Validate header X-Webhook-Secret.
-	2.	Parse payload.
+	2.	Parse payload — map camelCase nested format to snake_case (see 3.2a).
 	3.	Check webhook_id — skip if already processed.
 	4.	Upsert reservation row with timestamp guard.
 	5.	Enqueue hydration job.
@@ -81,6 +81,29 @@ Flow:
 
 Important:
 Webhook handler must never block on API calls.
+
+3.2a Real Webhook Payload Format
+
+The webhook-sender sends a nested structure (NOT flat snake_case):
+
+{
+  "event": "reservation.created",
+  "timestamp": "2026-03-01T22:33:06.252Z",   ← maps to event_timestamp
+  "webhookId": "wh_abc123",                   ← maps to webhook_id
+  "data": {
+    "reservationId": "res_00003",             ← maps to reservation_id
+    "propertyId":    "property_018",
+    "guestId":       "guest_012",
+    "status":        "confirmed",
+    "checkIn":       "2026-04-06",
+    "checkOut":      "2026-04-13",
+    "numGuests":     5,
+    "totalAmount":   1869.59,                 ← coerce to String for DB
+    "currency":      "USD"
+  }
+}
+
+Handler uses: const d = body.data ?? body to support both nested and flat payloads.
 
 ⸻
 
@@ -312,6 +335,15 @@ On server start:
 Webhook re-registration:
 	•	If health monitoring drops the webhook URL, re-register on next startup or via a periodic check.
 
+10a. GET /webhooks/registered Response Shape
+
+Returns { urls: string[] } — NOT a plain array. Extract with:
+
+  const body = JSON.parse(res.body);
+  const registered = Array.isArray(body) ? body : (body.urls ?? []);
+
+The webhook-sender health monitor will unregister a URL after ~7 consecutive non-200 responses. Return 200 fast to stay registered.
+
 ⸻
 
 11. Implementation Order
@@ -328,6 +360,14 @@ Webhook re-registration:
 
 ⸻
 
+11a. Security / Repo Hygiene
+
+	•	backend/.env is gitignored — never commit real credentials.
+	•	backend/.env.example committed with placeholder values.
+	•	Root .gitignore covers .env, node_modules/, dist/, logs, .DS_Store.
+
+⸻
+
 12. Scalability Considerations (Explainable)
 
 Future improvements:
@@ -339,7 +379,18 @@ Future improvements:
 
 ⸻
 
-13. Key Design Guarantees
+13. Frontend Implementation Notes
+
+	•	vite.config.ts must import from 'vitest/config' (not /// <reference types="vitest" />) for vitest v4+.
+	•	Vite dev proxy: /api/* → http://localhost:3000 — no hardcoded ports in source code.
+	•	EventSource mock in tests: constructable class with static instance; vi.stubGlobal at file top before imports; fireSSE calls wrapped in act().
+	•	Avoid getByText() for status values — matches both <option> and <StatusBadge>. Use getByRole('cell', { name: /status/ }) instead.
+	•	BroadcastPanel hidden when statusFilter is empty — prevents accidental mass-message to all guests.
+	•	recipientCount = new Set(filtered.map(r => r.guest_id)).size — deduped guest count, not row count.
+
+⸻
+
+14. Key Design Guarantees
 	•	Idempotent webhook handling via reservation_id upsert and webhook_id deduplication.
 	•	Safe out-of-order event processing via event_timestamp guard.
 	•	Cancelled is terminal — never reverted.
