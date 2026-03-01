@@ -64,7 +64,8 @@ export async function registerWebhook(): Promise<void> {
       }
 
       if (listRes.statusCode === 200) {
-        const registered: string[] = JSON.parse(listRes.body);
+        const body = JSON.parse(listRes.body);
+        const registered: string[] = Array.isArray(body) ? body : (body.urls ?? []);
         if (registered.includes(webhookUrl)) {
           console.log('[register] Webhook already registered');
           return;

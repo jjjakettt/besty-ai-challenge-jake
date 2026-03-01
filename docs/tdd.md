@@ -239,19 +239,36 @@ Never fire uncontrolled parallel requests.
 
 8. Frontend Design
 
-State
+Stack: React + Vite + TypeScript, port 5173. Vite proxy rewrites /api/* → http://localhost:3000.
+
+Component Structure
+
+	•	App.tsx — owns all state; handles data fetching, SSE subscription, sort/filter logic, and broadcast submission. Passes derived filtered/sorted array and callbacks to children.
+	•	components/FilterBar.tsx — fully controlled; renders status <select> and sort controls. No internal state.
+	•	components/ReservationTable.tsx — renders <table> from pre-filtered, pre-sorted rows. Clickable column headers emit onSort(field). Unhydrated guest name falls back to guest_id (italic).
+	•	components/StatusBadge.tsx — colour-coded <span>: green (confirmed), amber (modified), red (cancelled), grey (other).
+	•	components/BroadcastPanel.tsx — manages message input, sending flag, and feedback text. Calls onSend(message) prop on submit.
+
+State (in App.tsx)
 	•	reservations: Reservation[]
-	•	filters
-	•	sort state
+	•	statusFilter: string
+	•	sortField: keyof Reservation (default: event_timestamp)
+	•	sortDir: 'asc' | 'desc' (default: desc)
 
-Features
-	•	Real-time updating list.
-	•	Client-side filtering.
-	•	Client-side sorting.
-	•	Broadcast button appears only when filtered subset exists.
-	•	Modal or prompt for broadcast message.
+Derived
+	•	filtered = reservations.filter(status).sort(field, dir) — computed on each render, not stored in state.
 
-Filtering and sorting must be pure functions.
+Data flow
+	•	On mount: fetch GET /api/reservations → set reservations.
+	•	Open EventSource('/api/events') → on message: merge by reservation_id (replace existing or prepend new).
+	•	Clean up EventSource on unmount.
+
+Broadcast panel visibility
+	•	Shown only when statusFilter is set AND filtered.length > 0.
+	•	recipientCount = unique guest_ids in filtered list.
+	•	On submit: POST /api/broadcast with { guestIds: [...new Set(filtered.map(r => r.guest_id))], message }.
+
+Filtering and sorting must be pure functions applied to the reservations array.
 
 ⸻
 

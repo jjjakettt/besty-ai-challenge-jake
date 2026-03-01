@@ -33,8 +33,15 @@ besty-ai-challenge-jake/
 ├── frontend/
 │   ├── src/
 │   │   ├── main.tsx
-│   │   ├── App.tsx         # All UI logic in one component
-│   │   └── types.ts
+│   │   ├── types.ts
+│   │   ├── test-setup.ts
+│   │   ├── App.tsx                    # State, data fetching, SSE, layout glue
+│   │   ├── App.test.tsx               # Vitest + RTL integration tests
+│   │   └── components/
+│   │       ├── FilterBar.tsx          # Status dropdown + sort controls
+│   │       ├── ReservationTable.tsx   # Sortable table with rows
+│   │       ├── StatusBadge.tsx        # Colour-coded status pill
+│   │       └── BroadcastPanel.tsx     # Message textarea + submit + feedback
 │   ├── index.html
 │   └── package.json
 └── docs/
@@ -134,15 +141,23 @@ WHERE reservations.event_timestamp IS NULL
 - Start broadcast worker
 - Start HTTP server on port 3000
 
-### Step 9 — Frontend: `App.tsx` (30 min)
-- On mount: `GET /reservations` + subscribe `GET /events` via `EventSource`
-- State: `reservations`, `statusFilter`, `sortField`, `sortDir`, `broadcastMsg`
-- Table: reservation_id, guest name, email, status, check_in, check_out, total
-- Sort: click column header → toggle asc/desc (client-side)
-- Filter: status dropdown (all / confirmed / modified / cancelled)
-- Broadcast button: visible only when filter active and filtered list non-empty
-- On broadcast submit: `POST /broadcast` with filtered guestIds + message
-- SSE event → merge updated reservation into state array
+### Step 9 — Frontend: components + tests (30 min)
+
+**`types.ts`** — `Reservation` interface + `SortField` / `SortDir` types
+
+**`StatusBadge.tsx`** — colour-coded `<span>` for confirmed (green) / modified (amber) / cancelled (red)
+
+**`FilterBar.tsx`** — fully controlled; props: `statusFilter`, `onStatusChange`, `sortField`, `sortDir`, `onSortFieldChange`, `onSortDirChange`
+
+**`ReservationTable.tsx`** — receives pre-filtered, pre-sorted rows; clickable column headers call `onSort(field)`; guest name falls back to `guest_id` (italic) when not hydrated; uses `<StatusBadge>`
+
+**`BroadcastPanel.tsx`** — internal state: `message`, `sending`, `status`; props: `recipientCount`, `onSend(message)`; disables button while sending or message empty; shows success/error feedback
+
+**`App.tsx`** — owns all cross-component state (`reservations`, `statusFilter`, `sortField`, `sortDir`); on mount: `GET /api/reservations` + `new EventSource('/api/events')` (cleaned up on unmount); derived `filtered` array passed to children; broadcast panel visible only when `statusFilter` set and `filtered.length > 0`
+
+**Vite proxy** — all frontend calls use `/api/*`; proxy rewrites to `http://localhost:3000`
+
+**`App.test.tsx`** — 8 tests (see Testing section below)
 
 ---
 
@@ -166,13 +181,31 @@ CREATE TABLE IF NOT EXISTS broadcast_jobs (
 
 ### Framework
 - **Backend**: `vitest` + `supertest`
-- No frontend tests (not worth the time cost)
+- **Frontend**: `vitest` + `@testing-library/react` + `@testing-library/jest-dom` + `jsdom`
 
 ### Install
 ```bash
+# backend
 npm install -D vitest supertest @types/supertest
+
+# frontend
+npm install -D vitest @testing-library/react @testing-library/jest-dom @testing-library/user-event jsdom
 ```
-Add to `backend/package.json`: `"test": "vitest run"`
+Add to `backend/package.json` and `frontend/package.json`: `"test": "vitest run"`
+
+Add to `frontend/vite.config.ts`:
+```ts
+test: {
+  environment: 'jsdom',
+  globals: true,
+  setupFiles: './src/test-setup.ts',
+},
+```
+
+`frontend/src/test-setup.ts`:
+```ts
+import '@testing-library/jest-dom';
+```
 
 ### Unit Tests: `backend/src/__tests__/`
 
@@ -204,10 +237,24 @@ Use `supertest` against the Express app (exported before `listen()`). Mock DB ca
 - `GET /reservations` → 200 array
 - `POST /broadcast` valid body → 200
 
+### Frontend Tests (`frontend/src/App.test.tsx`)
+
+Mock `fetch` globally and `EventSource` with a constructable class that exposes `onmessage` for test-controlled event firing.
+
+8 tests:
+1. Initial load renders reservation rows from `GET /api/reservations`
+2. New SSE reservation appears in table
+3. SSE update merges into existing row — no duplicate
+4. Status filter shows only matching rows
+5. Broadcast panel hidden when no filter active
+6. Broadcast panel visible when filter active and results exist
+7. Broadcast submit calls `POST /api/broadcast` with deduped guestIds
+8. `StatusBadge` renders correct colour indicator per status value
+
 ### What NOT to test
-- SSE streaming (async, hard to set up in time)
+- SSE streaming infrastructure (covered by mocked EventSource in frontend tests)
 - Broadcast worker retries (covered by guestApi unit tests)
-- Frontend
+- Individual sub-component internals beyond what's covered via App integration tests
 
 ---
 
