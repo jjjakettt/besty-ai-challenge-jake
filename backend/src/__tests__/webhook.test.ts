@@ -129,4 +129,98 @@ describe('POST /webhooks', () => {
     expect(res2.status).toBe(200);
     expect(mockUpsert).toHaveBeenCalledTimes(1);
   });
+
+  /**
+   * The real webhook-sender wraps fields in a nested `data` object using
+   * camelCase keys, with webhookId and timestamp at the top level.
+   * All fields must be mapped correctly before upsert is called.
+   */
+  it('real nested camelCase payload → 200, fields correctly mapped', async () => {
+    const { app, enqueue, emit } = makeApp();
+
+    const nested = {
+      event:     'reservation.created',
+      timestamp: '2026-03-01T22:33:06.252Z',
+      webhookId: 'wh-nested-1',
+      data: {
+        reservationId: 'res-nested-1',
+        propertyId:    'prop-1',
+        guestId:       'guest-nested',
+        status:        'confirmed',
+        checkIn:       '2026-04-06',
+        checkOut:      '2026-04-13',
+        numGuests:     5,
+        totalAmount:   1869.59,
+        currency:      'USD',
+      },
+    };
+
+    const res = await request(app)
+      .post('/webhooks')
+      .set('x-webhook-secret', SECRET)
+      .send(nested);
+
+    expect(res.status).toBe(200);
+    expect(mockUpsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        reservation_id:  'res-nested-1',
+        guest_id:        'guest-nested',
+        webhook_id:      'wh-nested-1',
+        event_timestamp: '2026-03-01T22:33:06.252Z',
+        num_guests:      5,
+        total_amount:    '1869.59',
+        check_in:        '2026-04-06',
+        check_out:       '2026-04-13',
+      }),
+    );
+    expect(enqueue).toHaveBeenCalledWith('guest-nested');
+    expect(emit).toHaveBeenCalledOnce();
+  });
+
+  /**
+   * A rapid burst of N concurrent requests with distinct webhook_ids must
+   * all return 200 and each trigger exactly one upsert. The in-memory dedup
+   * Set must not incorrectly merge distinct events.
+   */
+  it('rapid burst — 5 concurrent unique webhook_ids all accepted', async () => {
+    const { app } = makeApp();
+
+    const payloads = Array.from({ length: 5 }, (_, i) => ({
+      ...VALID_PAYLOAD,
+      webhook_id:      `wh-burst-${i}`,
+      event_timestamp: `2024-01-01T00:00:0${i}Z`,
+    }));
+
+    const results = await Promise.all(
+      payloads.map((p) =>
+        request(app)
+          .post('/webhooks')
+          .set('x-webhook-secret', SECRET)
+          .send(p),
+      ),
+    );
+
+    for (const r of results) expect(r.status).toBe(200);
+    expect(mockUpsert).toHaveBeenCalledTimes(5);
+  });
+
+  /**
+   * Out-of-order delivery: a newer event arrives first, then an older one for
+   * the same reservation. Both must be accepted with 200 — the webhook layer
+   * does not filter by timestamp. The DB upsert's WHERE clause guards against
+   * stale overwrites at the persistence layer.
+   */
+  it('out-of-order delivery — both accepted, upsert called twice', async () => {
+    const { app } = makeApp();
+
+    const newer = { ...VALID_PAYLOAD, webhook_id: 'wh-newer', event_timestamp: '2024-01-01T02:00:00Z' };
+    const older = { ...VALID_PAYLOAD, webhook_id: 'wh-older', event_timestamp: '2024-01-01T01:00:00Z' };
+
+    const res1 = await request(app).post('/webhooks').set('x-webhook-secret', SECRET).send(newer);
+    const res2 = await request(app).post('/webhooks').set('x-webhook-secret', SECRET).send(older);
+
+    expect(res1.status).toBe(200);
+    expect(res2.status).toBe(200);
+    expect(mockUpsert).toHaveBeenCalledTimes(2);
+  });
 });
